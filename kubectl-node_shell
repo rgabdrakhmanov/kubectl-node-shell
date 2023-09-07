@@ -2,18 +2,12 @@
 set -e
 
 kubectl=kubectl
-version=1.8.0
+version=1.5.5
 generator=""
 node=""
 nodefaultctx=0
 nodefaultns=0
-container_cpu="${KUBECTL_NODE_SHELL_POD_CPU:-100m}"
-container_memory="${KUBECTL_NODE_SHELL_POD_MEMORY:-256Mi}"
-volumes="[]"
-volume_mounts="[]"
-x_mode=0
-labels="${KUBECTL_NODE_SHELL_LABELS}"
-
+cmd='[ "nsenter", "--target", "1", "--mount", "--uts", "--ipc", "--net", "--pid", "--"'
 if [ -t 0 ]; then
   tty=true
 else
@@ -58,12 +52,6 @@ while [ $# -gt 0 ]; do
     kubectl="$kubectl --namespace=${key##*=}"
     shift
     ;;
-  -x)
-    x_mode=1
-    volumes='[{"hostPath":{"path":"/","type":""},"name":"host-root"}]'
-    volume_mounts='[{"mountPath":"/host","name":"host-root"}]'
-    shift
-    ;;
   --)
     shift
     break
@@ -80,65 +68,37 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Set the default context and namespace to avoid situations where the user switch them during the build process
+[ "$nodefaultctx" = 1 ] || kubectl="$kubectl --context=$(${kubectl} config current-context)"
+[ "$nodefaultns" = 1 ] || kubectl="$kubectl --namespace=$(${kubectl} config view --minify --output 'jsonpath={.contexts..namespace}')"
+
+if [ $# -gt 0 ]; then
+  while [ $# -gt 0 ]; do
+    cmd="$cmd, \"$(echo "$1" | \
+      awk '{gsub(/["\\]/,"\\\\&");gsub(/\x1b/,"\\u001b");printf "%s",last;last=$0"\\n"} END{print $0}' \
+    )\""
+    shift
+  done
+  cmd="$cmd ]"
+else
+  cmd="$cmd, \"bash\", \"-l\" ]"
+fi
+
 if [ -z "$node" ]; then
   echo "Please specify node name"
   exit 1
 fi
 
-# Set the default context and namespace to avoid situations where the user switch them during the build process
-[ "$nodefaultctx" = 1 ] || kubectl="$kubectl --context=$(${kubectl} config current-context)"
-[ "$nodefaultns" = 1 ] || kubectl="$kubectl --namespace=$(${kubectl} config view --minify --output 'jsonpath={.contexts..namespace}')"
+image="${KUBECTL_NODE_SHELL_IMAGE:-docker.io/library/alpine}"
+pod="nsenter-$(env LC_ALL=C tr -dc a-z0-9 </dev/urandom | head -c 6)"
 
-# Check the node and retrieve the node OS label
-os="$($kubectl get node $node -o jsonpath="{.metadata.labels.kubernetes\.io/os}" || exit 1)"
+# Check the node
+$kubectl get node "$node" >/dev/null || exit 1
 
-# Set pod configuration per operating system
-if [ "$os" = "windows" ]; then
-  image="${KUBECTL_NODE_SHELL_IMAGE_WINDOWS:-mcr.microsoft.com/powershell}"
-  name="pwsh"
-  pod="${name}-$(env LC_ALL=C tr -dc a-z0-9 </dev/urandom | head -c 6)"
-  # pwsh has to be launched via cmd.exe because of how containerd 1.6 handles the mount of the container filesystem
-  # see https://kubernetes.io/docs/tasks/configure-pod-container/create-hostprocess-pod/#volume-mounts
-  cmd_start='"cmd.exe", "/c", "%CONTAINER_SANDBOX_MOUNT_POINT%\\Program Files\\PowerShell\\latest\\pwsh.exe", "-nol", "-wd", "C:\\"'
-  cmd_arg_prefix=', "-Command"'
-  cmd_default=''
-  security_context='{"privileged":true,"windowsOptions":{"hostProcess":true,"runAsUserName":"NT AUTHORITY\\SYSTEM"}}'
-else # If the OS isn't windows, assume linux
-  image="${KUBECTL_NODE_SHELL_IMAGE:-docker.io/library/alpine}"
-  name="nsenter"
-  pod="${name}-$(env LC_ALL=C tr -dc a-z0-9 </dev/urandom | head -c 6)"
-  cmd_start='"nsenter", "--target", "1", "--mount", "--uts", "--ipc", "--net", "--pid"'
-  cmd_arg_prefix=', "--"'
-  cmd_default=', "bash", "-l"'
-  security_context='{"privileged":true}'
-fi
-
-# Build the container command
-if [ $# -gt 0 ]; then
-  if [ "$x_mode" -eq 1 ]; then
-    cmd='['
-  else
-    cmd="[ $cmd_start $cmd_arg_prefix,"
-  fi
-  c=""
-  while [ $# -gt 0 ]; do
-    cmd="${cmd}${c} \"$(echo "$1" | \
-      awk '{gsub(/["\\]/,"\\\\&");gsub(/\x1b/,"\\u001b");printf "%s",last;last=$0"\\n"} END{print $0}' \
-    )\""
-    c=,
-    shift
-  done
-  cmd="$cmd ]"
-else
-  if [ "$x_mode" = 1 ]; then
-    cmd='null'
-  else
-    cmd="[ $cmd_start $cmd_default ]"
-  fi
-fi
-
+container_cpu="${KUBECTL_NODE_SHELL_POD_CPU:-100m}"
+container_memory="${KUBECTL_NODE_SHELL_POD_MEMORY:-256Mi}"
 overrides="$(
-cat <<EOT
+  cat <<EOT
 {
   "spec": {
     "nodeName": "$node",
@@ -146,25 +106,37 @@ cat <<EOT
     "hostNetwork": true,
     "containers": [
       {
-        "securityContext": $security_context,
+        "securityContext": {
+          "privileged": true
+        },
         "image": "$image",
-        "name": "$name",
+        "name": "nsenter",
         "stdin": true,
         "stdinOnce": true,
         "tty": $tty,
         "command": $cmd,
         "resources": {
-          "limits":   { "cpu": "${container_cpu}", "memory": "${container_memory}" },
-          "requests": { "cpu": "${container_cpu}", "memory": "${container_memory}" }
-        },
-        "volumeMounts": $volume_mounts
+          "limits": {
+            "cpu": "${container_cpu}",
+            "memory": "${container_memory}"
+          },
+          "requests": {
+            "cpu": "${container_cpu}",
+            "memory": "${container_memory}"
+          }
+        }
       }
     ],
     "tolerations": [
-      { "key": "CriticalAddonsOnly", "operator": "Exists" },
-      { "effect": "NoExecute",       "operator": "Exists" }
-    ],
-    "volumes": $volumes
+      {
+        "key": "CriticalAddonsOnly",
+        "operator": "Exists"
+      },
+      {
+        "effect": "NoExecute",
+        "operator": "Exists"
+      }
+    ]
   }
 }
 EOT
@@ -179,4 +151,4 @@ fi
 trap "EC=\$?; $kubectl delete pod --wait=false $pod >&2 || true; exit \$EC" EXIT INT TERM
 
 echo "spawning \"$pod\" on \"$node\"" >&2
-$kubectl run --image "$image" --restart=Never --overrides="$overrides" --labels="$labels" $([ "$tty" = true ] && echo -t) -i "$pod" $generator
+$kubectl run --image "$image" --restart=Never --overrides="$overrides"  $([ "$tty" = true ] && echo -t) -i "$pod" $generator
